@@ -1,5 +1,7 @@
-use clip_bridge::{ClipboardType, wayland::WaylandState};
-use tokio::sync::mpsc;
+use clip_bridge::{ClipboardContent, ClipboardType, wayland::WaylandState};
+use compact_str::ToCompactString;
+use std::sync::mpsc as std_mpsc;
+use tokio::sync::mpsc as tokio_mpsc;
 use tracing::info;
 use wayland_client::Connection;
 
@@ -9,9 +11,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_max_level(tracing::Level::DEBUG)
         .init();
 
-    let (sync_tx, _sync_rx) = mpsc::unbounded_channel();
+    let (sync_tx, _sync_rx) = tokio_mpsc::unbounded_channel();
     let (set_clipboard_tx, _set_clipboard_rx) =
-        mpsc::unbounded_channel::<(String, ClipboardType)>();
+        std_mpsc::channel::<(ClipboardContent, ClipboardType)>();
 
     let wayland_conn = Connection::connect_to_env()?;
     let display = wayland_conn.display();
@@ -28,7 +30,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run the rest in spawn_blocking to have a tokio runtime
     tokio::task::spawn_blocking(move || {
-        wayland_state.set_clipboard_content("Hello, World!".to_string(), ClipboardType::Clipboard);
+        wayland_state.set_clipboard_content(
+            ClipboardContent::Text("Hello, World!".to_compact_string()),
+            ClipboardType::Clipboard,
+        );
 
         info!("Before second roundtrip");
         event_queue.roundtrip(&mut wayland_state).unwrap();

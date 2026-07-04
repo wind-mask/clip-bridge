@@ -1,11 +1,12 @@
 use std::fs::File;
 use std::os::fd::AsFd;
 use std::sync::Arc;
+use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
 use nix::unistd;
 use tokio::sync::Mutex;
-use tokio::sync::mpsc;
+use tokio::sync::mpsc as tokio_mpsc;
 use tokio::time;
 use tracing::{debug, error, info, warn};
 use wayland_client::{
@@ -24,7 +25,10 @@ use wayland_protocols_wlr::data_control::v1::client::{
     zwlr_data_control_source_v1::{self, ZwlrDataControlSourceV1},
 };
 
-use crate::{ClipboardContent, ClipboardType, SyncEvent};
+use crate::{
+    ClipboardContent, ClipboardType, PREFERRED_MIME_TYPES, SyncEvent, TEXT_PLAIN_UTF8_ATOM,
+    decode_clipboard_content,
+};
 
 // ============================================================================
 // Wayland State
@@ -33,28 +37,50 @@ use crate::{ClipboardContent, ClipboardType, SyncEvent};
 #[derive(Debug, Clone, Copy)]
 pub struct GlobalData;
 
+fn preferred_mime_type(mime_types: &[String]) -> Option<String> {
+    PREFERRED_MIME_TYPES
+        .iter()
+        .find(|mime_type| mime_types.iter().any(|offered| offered == **mime_type))
+        .map(|mime_type| (*mime_type).to_string())
+}
+
+fn write_all_fd<Fd: AsFd>(fd: &Fd, mut data: &[u8]) -> Result<(), nix::errno::Errno> {
+    use nix::unistd::write;
+
+    while !data.is_empty() {
+        let written = write(fd, data)?;
+        if written == 0 {
+            return Err(nix::errno::Errno::EIO);
+        }
+        data = &data[written..];
+    }
+
+    Ok(())
+}
+
 pub struct WaylandState {
     _qh: QueueHandle<Self>,
-    sync_tx: mpsc::UnboundedSender<SyncEvent>,
+    sync_tx: tokio_mpsc::UnboundedSender<SyncEvent>,
     data_control_manager: Option<ZwlrDataControlManagerV1>,
     data_control_device: Option<ZwlrDataControlDeviceV1>,
     primary_selection_manager: Option<ZwpPrimarySelectionDeviceManagerV1>,
     compositor: Option<wl_compositor::WlCompositor>,
     seat: Option<wl_seat::WlSeat>,
-    clipboard_content: Arc<Mutex<Option<String>>>,
-    primary_content: Arc<Mutex<Option<String>>>,
+    clipboard_content: Arc<Mutex<Option<ClipboardContent>>>,
+    primary_content: Arc<Mutex<Option<ClipboardContent>>>,
     clipboard_source: Option<ZwlrDataControlSourceV1>,
     primary_source: Option<ZwlrDataControlSourceV1>,
-    _set_clipboard_tx: mpsc::UnboundedSender<(String, ClipboardType)>,
+    _set_clipboard_tx: std_mpsc::Sender<(ClipboardContent, ClipboardType)>,
     // Store content to be written when requested
-    pending_primary_content: Arc<Mutex<Option<String>>>,
+    pending_primary_content: Arc<Mutex<Option<ClipboardContent>>>,
+    data_offers: Vec<(ZwlrDataControlOfferV1, Vec<String>)>,
 }
 
 impl WaylandState {
     pub fn new(
         qh: QueueHandle<Self>,
-        sync_tx: mpsc::UnboundedSender<SyncEvent>,
-        set_clipboard_tx: mpsc::UnboundedSender<(String, ClipboardType)>,
+        sync_tx: tokio_mpsc::UnboundedSender<SyncEvent>,
+        set_clipboard_tx: std_mpsc::Sender<(ClipboardContent, ClipboardType)>,
     ) -> Self {
         Self {
             _qh: qh,
@@ -70,10 +96,23 @@ impl WaylandState {
             primary_source: None,
             _set_clipboard_tx: set_clipboard_tx,
             pending_primary_content: Arc::new(Mutex::new(None)),
+            data_offers: Vec::new(),
         }
     }
 
-    pub fn set_clipboard_content(&mut self, content: String, clipboard_type: ClipboardType) {
+    fn mime_types_for_offer(&self, offer: &ZwlrDataControlOfferV1) -> Vec<String> {
+        self.data_offers
+            .iter()
+            .find(|(stored_offer, _)| stored_offer == offer)
+            .map(|(_, mime_types)| mime_types.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn set_clipboard_content(
+        &mut self,
+        content: ClipboardContent,
+        clipboard_type: ClipboardType,
+    ) {
         info!(
             "[Wayland] Setting clipboard content: type={:?}, len={}",
             clipboard_type,
@@ -96,11 +135,9 @@ impl WaylandState {
                 // Create new source BEFORE destroying old one to avoid gap
                 if let Some(manager) = &self.data_control_manager {
                     let source = manager.create_data_source(&self._qh, ());
-                    source.offer("text/plain;charset=utf-8".into());
-                    source.offer("text/plain".into());
-                    source.offer("UTF8_STRING".into());
-                    source.offer("TEXT".into());
-                    source.offer("STRING".into());
+                    for mime_type in content.offered_mime_types() {
+                        source.offer(mime_type.into());
+                    }
 
                     debug!("[Wayland] Created clipboard source: {:?}", source);
 
@@ -131,11 +168,9 @@ impl WaylandState {
                 // Create new source BEFORE destroying old one to avoid gap
                 if let Some(manager) = &self.data_control_manager {
                     let source = manager.create_data_source(&self._qh, ());
-                    source.offer("text/plain;charset=utf-8".into());
-                    source.offer("text/plain".into());
-                    source.offer("UTF8_STRING".into());
-                    source.offer("TEXT".into());
-                    source.offer("STRING".into());
+                    for mime_type in content.offered_mime_types() {
+                        source.offer(mime_type.into());
+                    }
 
                     debug!("[Wayland] Created primary source: {:?}", source);
 
@@ -291,16 +326,25 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for WaylandState {
         match event {
             zwlr_data_control_device_v1::Event::DataOffer { id } => {
                 debug!("[Wayland] New data offer: {:?}", id);
+                state.data_offers.push((id, Vec::new()));
             }
             zwlr_data_control_device_v1::Event::Selection { id } => {
                 info!("[Wayland] Selection changed: {:?}", id);
                 if let Some(offer) = id {
+                    let mime_types = state.mime_types_for_offer(&offer);
+                    let mime_type = preferred_mime_type(&mime_types).unwrap_or_else(|| {
+                        warn!(
+                            "[Wayland] No supported MIME advertised, falling back to {}",
+                            TEXT_PLAIN_UTF8_ATOM
+                        );
+                        TEXT_PLAIN_UTF8_ATOM.to_string()
+                    });
+
                     // Create pipes for receiving data
                     match unistd::pipe() {
                         Ok((read_fd, write_fd)) => {
                             debug!("[Wayland] Created pipe for reading clipboard data");
-                            // Request text content with pipe
-                            offer.receive("text/plain;charset=utf-8".into(), write_fd.as_fd());
+                            offer.receive(mime_type.clone(), write_fd.as_fd());
                             // Close the write end immediately after receive() - this signals EOF to the reader
                             // The compositor has already duplicated the fd, so it's safe to close
                             let _ = unistd::close(write_fd);
@@ -343,26 +387,37 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for WaylandState {
                                     }
                                 }
 
-                                debug!("[Wayland] Read {} bytes from clipboard pipe", buffer.len());
-                                if let Ok(text) = String::from_utf8(buffer) {
-                                    if text.is_empty() {
+                                debug!(
+                                    "[Wayland] Read {} bytes from clipboard pipe for {}",
+                                    buffer.len(),
+                                    mime_type
+                                );
+
+                                match decode_clipboard_content(&mime_type, buffer) {
+                                    Ok(content) if content.is_empty() => {
                                         // Wechat sends empty clipboard content to wayland,
                                         // however it uses x11 clipboard to send the actual content.
                                         // So we ignore empty clipboard content.
                                         warn!("[Wayland] Received empty clipboard content");
-                                    } else {
+                                    }
+                                    Ok(content) => {
                                         info!(
-                                            "[Wayland] Clipboard content received: {} chars",
-                                            text.len()
+                                            "[Wayland] Clipboard content received: mime={:?}, len={}",
+                                            content.primary_mime_type(),
+                                            content.len()
                                         );
-                                        *content_ref.lock().await = Some(text.clone());
+                                        *content_ref.lock().await = Some(content.clone());
                                         let _ = sync_tx.send(SyncEvent::WaylandToX11 {
-                                            content: ClipboardContent::Text(text),
+                                            content,
                                             clipboard_type: ClipboardType::Clipboard,
                                         });
                                     }
-                                } else {
-                                    warn!("[Wayland] Failed to decode clipboard as UTF-8");
+                                    Err(e) => {
+                                        warn!(
+                                            "[Wayland] Failed to decode clipboard content: {}",
+                                            e
+                                        );
+                                    }
                                 }
                             });
                         }
@@ -457,8 +512,8 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for WaylandState {
 
 impl Dispatch<ZwlrDataControlOfferV1, ()> for WaylandState {
     fn event(
-        _state: &mut Self,
-        _offer: &ZwlrDataControlOfferV1,
+        state: &mut Self,
+        offer: &ZwlrDataControlOfferV1,
         event: zwlr_data_control_offer_v1::Event,
         _data: &(),
         _conn: &Connection,
@@ -466,6 +521,17 @@ impl Dispatch<ZwlrDataControlOfferV1, ()> for WaylandState {
     ) {
         if let zwlr_data_control_offer_v1::Event::Offer { mime_type } = event {
             debug!("[Wayland] Offer mime type: {}", mime_type);
+            if let Some((_, mime_types)) = state
+                .data_offers
+                .iter_mut()
+                .find(|(stored_offer, _)| stored_offer == offer)
+            {
+                if !mime_types.contains(&mime_type) {
+                    mime_types.push(mime_type);
+                }
+            } else {
+                state.data_offers.push((offer.clone(), vec![mime_type]));
+            }
         }
     }
 }
@@ -503,24 +569,22 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for WaylandState {
                     return;
                 };
 
-                if let Some(data) = content {
-                    debug!("[Wayland] Writing {} bytes to fd", data.len());
-                    // Write the actual content to file descriptor
-                    use nix::unistd::write;
-                    match write(&fd, data.as_bytes()) {
-                        Ok(bytes_written) => {
-                            debug!("[Wayland] Successfully wrote {} bytes", bytes_written);
-                            if bytes_written != data.len() {
-                                warn!(
-                                    "[Wayland] Partial write: {} of {} bytes",
-                                    bytes_written,
-                                    data.len()
-                                );
+                if let Some(content) = content {
+                    if let Some(data) = content.bytes_for_mime(&mime_type) {
+                        debug!("[Wayland] Writing {} bytes to fd", data.len());
+                        match write_all_fd(&fd, data) {
+                            Ok(()) => {
+                                debug!("[Wayland] Successfully wrote {} bytes", data.len());
+                            }
+                            Err(e) => {
+                                error!("[Wayland] Failed to write data: {}", e);
                             }
                         }
-                        Err(e) => {
-                            error!("[Wayland] Failed to write data: {}", e);
-                        }
+                    } else {
+                        warn!(
+                            "[Wayland] Content is not available as requested MIME type: {}",
+                            mime_type
+                        );
                     }
                     // OwnedFd will be closed automatically when dropped
                 } else {
@@ -584,28 +648,25 @@ impl Dispatch<ZwpPrimarySelectionSourceV1, ()> for WaylandState {
                 // Get the content for primary selection
                 let content = state.pending_primary_content.blocking_lock().clone();
 
-                if let Some(data) = content {
-                    debug!("[Wayland] Writing {} bytes to primary fd", data.len());
-                    // Write the actual content to file descriptor
-                    use nix::unistd::write;
-                    // Use write directly to avoid File ownership issues
-                    match write(&fd, data.as_bytes()) {
-                        Ok(bytes_written) => {
-                            debug!(
-                                "[Wayland] Successfully wrote {} bytes to primary",
-                                bytes_written
-                            );
-                            if bytes_written != data.len() {
-                                warn!(
-                                    "[Wayland] Partial write to primary: {} of {} bytes",
-                                    bytes_written,
+                if let Some(content) = content {
+                    if let Some(data) = content.bytes_for_mime(&mime_type) {
+                        debug!("[Wayland] Writing {} bytes to primary fd", data.len());
+                        match write_all_fd(&fd, data) {
+                            Ok(()) => {
+                                debug!(
+                                    "[Wayland] Successfully wrote {} bytes to primary",
                                     data.len()
                                 );
                             }
+                            Err(e) => {
+                                error!("[Wayland] Failed to write primary data: {}", e);
+                            }
                         }
-                        Err(e) => {
-                            error!("[Wayland] Failed to write primary data: {}", e);
-                        }
+                    } else {
+                        warn!(
+                            "[Wayland] Primary content is not available as requested MIME type: {}",
+                            mime_type
+                        );
                     }
                     // OwnedFd will be closed automatically when dropped
                 } else {

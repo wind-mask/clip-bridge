@@ -3,10 +3,15 @@
 // ============================================================================
 
 use std::collections::HashMap;
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::Arc;
+use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
-use tokio::sync::{Mutex, mpsc};
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+use nix::unistd;
+use tokio::sync::Mutex;
+use tokio::sync::mpsc as tokio_mpsc;
 use tracing::{debug, error, info, warn};
 
 use x11rb::CURRENT_TIME;
@@ -14,16 +19,16 @@ use x11rb::connection::Connection as X11Connection;
 use x11rb::protocol::Event;
 use x11rb::protocol::xfixes::{ConnectionExt as XFixesConnectionExt, SelectionEventMask};
 use x11rb::protocol::xproto::{
-    Atom, AtomEnum, ConnectionExt, CreateWindowAux, EventMask, PropertyNotifyEvent,
+    Atom, AtomEnum, ConnectionExt, CreateWindowAux, EventMask, Property, PropertyNotifyEvent,
     SELECTION_NOTIFY_EVENT, SelectionClearEvent, SelectionNotifyEvent, SelectionRequestEvent,
     Window, WindowClass,
 };
 use x11rb::wrapper::ConnectionExt as _;
 
 use crate::{
-    CLIPBOARD_ATOM, ClipboardContent, ClipboardType, INCR_ATOM, MULTIPLE_ATOM, PRIMARY_ATOM,
-    STRING_ATOM, SyncEvent, TARGETS_ATOM, TEXT_ATOM, TEXT_PLAIN_ATOM, TEXT_PLAIN_UTF8_ATOM,
-    UTF8_STRING_ATOM,
+    CLIPBOARD_ATOM, ClipboardContent, ClipboardType, IMAGE_MIME_TYPES, INCR_ATOM, MULTIPLE_ATOM,
+    PREFERRED_MIME_TYPES, PRIMARY_ATOM, SyncEvent, TARGETS_ATOM, TEXT_MIME_TYPES, TEXT_PLAIN_ATOM,
+    TEXT_PLAIN_UTF8_ATOM, UTF8_STRING_ATOM, decode_clipboard_content,
 };
 
 pub struct X11State {
@@ -31,18 +36,20 @@ pub struct X11State {
     _screen_num: usize,
     atoms: HashMap<String, Atom>,
     pub window: Window,
-    sync_tx: mpsc::UnboundedSender<SyncEvent>,
-    clipboard_content: Arc<Mutex<Option<String>>>,
-    primary_content: Arc<Mutex<Option<String>>>,
-    set_clipboard_rx: mpsc::UnboundedReceiver<(String, ClipboardType)>,
+    sync_tx: tokio_mpsc::UnboundedSender<SyncEvent>,
+    clipboard_content: Arc<Mutex<Option<ClipboardContent>>>,
+    primary_content: Arc<Mutex<Option<ClipboardContent>>>,
+    set_clipboard_rx: std_mpsc::Receiver<(ClipboardContent, ClipboardType)>,
+    wake_read: OwnedFd,
 }
 
 impl X11State {
     pub fn new(
         conn: x11rb::rust_connection::RustConnection,
         screen_num: usize,
-        sync_tx: mpsc::UnboundedSender<SyncEvent>,
-        set_clipboard_rx: mpsc::UnboundedReceiver<(String, ClipboardType)>,
+        sync_tx: tokio_mpsc::UnboundedSender<SyncEvent>,
+        set_clipboard_rx: std_mpsc::Receiver<(ClipboardContent, ClipboardType)>,
+        wake_read: OwnedFd,
     ) -> Result<Self, String> {
         let screen = &conn.setup().roots[screen_num];
         let window = conn
@@ -84,18 +91,17 @@ impl X11State {
 
         // Intern atoms
         let mut atoms = HashMap::new();
-        let atom_names = vec![
+        let mut atom_names = vec![
             CLIPBOARD_ATOM,
             PRIMARY_ATOM,
             TARGETS_ATOM,
             MULTIPLE_ATOM,
             INCR_ATOM,
             UTF8_STRING_ATOM,
-            TEXT_ATOM,
-            STRING_ATOM,
             TEXT_PLAIN_UTF8_ATOM,
             TEXT_PLAIN_ATOM,
         ];
+        atom_names.extend_from_slice(IMAGE_MIME_TYPES);
 
         for name in &atom_names {
             let atom = conn
@@ -144,6 +150,7 @@ impl X11State {
             clipboard_content: Arc::new(Mutex::new(None)),
             primary_content: Arc::new(Mutex::new(None)),
             set_clipboard_rx,
+            wake_read,
         })
     }
 
@@ -151,9 +158,344 @@ impl X11State {
         self.atoms.get(name).copied()
     }
 
+    fn intern_temp_atom(&self, name: &str) -> Result<Atom, String> {
+        self.conn
+            .intern_atom(false, name.as_bytes())
+            .map_err(|e| format!("Failed to intern atom {}: {}", name, e))?
+            .reply()
+            .map(|reply| reply.atom)
+            .map_err(|e| format!("Failed to get atom reply for {}: {}", name, e))
+    }
+
+    fn mime_type_for_atom(&self, atom: Atom) -> Option<&'static str> {
+        PREFERRED_MIME_TYPES
+            .iter()
+            .copied()
+            .find(|mime_type| self.get_atom(mime_type) == Some(atom))
+    }
+
+    fn target_atoms_for_content(&self, content: Option<&ClipboardContent>) -> Vec<Atom> {
+        let mut atoms = Vec::new();
+
+        match content {
+            Some(ClipboardContent::Text(_)) => {
+                for mime_type in TEXT_MIME_TYPES {
+                    if let Some(atom) = self.get_atom(mime_type) {
+                        atoms.push(atom);
+                    }
+                }
+            }
+            Some(ClipboardContent::Data { mime_type, .. }) => {
+                if let Some(atom) = self.get_atom(mime_type) {
+                    atoms.push(atom);
+                }
+            }
+            Some(ClipboardContent::Empty) | None => {}
+        }
+
+        if let Some(targets) = self.get_atom(TARGETS_ATOM) {
+            atoms.push(targets);
+        }
+
+        atoms
+    }
+
+    fn choose_supported_targets(&self, offered_targets: &[Atom]) -> Vec<(Atom, &'static str)> {
+        let mut targets = Vec::new();
+
+        for mime_type in PREFERRED_MIME_TYPES {
+            if let Some(atom) = self.get_atom(mime_type)
+                && (offered_targets.is_empty() || offered_targets.contains(&atom))
+            {
+                targets.push((atom, *mime_type));
+            }
+        }
+
+        targets
+    }
+
+    fn wait_for_selection_notify(
+        &self,
+        target: Atom,
+        property: Atom,
+    ) -> Result<Option<SelectionNotifyEvent>, String> {
+        for _ in 0..25 {
+            std::thread::sleep(Duration::from_millis(20));
+
+            match self.conn.poll_for_event() {
+                Ok(Some(Event::SelectionNotify(notify)))
+                    if notify.target == target || notify.property == property =>
+                {
+                    return Ok(Some(notify));
+                }
+                Ok(Some(Event::SelectionRequest(event))) => {
+                    self.handle_selection_request(event)?;
+                }
+                Ok(Some(Event::PropertyNotify(_))) => {}
+                Ok(Some(_)) => {}
+                Ok(None) => {}
+                Err(e) => {
+                    debug!("[X11] Poll error while waiting for selection notify: {}", e);
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn request_selection_targets(&self, selection_atom: Atom) -> Result<Vec<Atom>, String> {
+        let targets = self.get_atom(TARGETS_ATOM).unwrap();
+        let property = self.intern_temp_atom("CLIP_TEMP_TARGETS")?;
+
+        self.conn
+            .convert_selection(self.window, selection_atom, targets, property, CURRENT_TIME)
+            .map_err(|e| format!("Failed to convert TARGETS selection: {}", e))?;
+        self.conn
+            .flush()
+            .map_err(|e| format!("Failed to flush connection: {}", e))?;
+
+        let Some(notify) = self.wait_for_selection_notify(targets, property)? else {
+            debug!("[X11] No TARGETS response from selection owner");
+            return Ok(Vec::new());
+        };
+
+        if notify.property == AtomEnum::NONE.into() {
+            debug!("[X11] Selection owner did not provide TARGETS");
+            return Ok(Vec::new());
+        }
+
+        let prop = self
+            .conn
+            .get_property(false, self.window, notify.property, AtomEnum::ATOM, 0, 1024)
+            .map_err(|e| format!("Failed to get TARGETS property: {}", e))?
+            .reply()
+            .map_err(|e| format!("Failed to get TARGETS property reply: {}", e))?;
+
+        let targets = prop.value32().into_iter().flatten().collect::<Vec<_>>();
+
+        self.conn
+            .delete_property(self.window, notify.property)
+            .map_err(|e| format!("Failed to delete TARGETS property: {}", e))?;
+        self.conn
+            .flush()
+            .map_err(|e| format!("Failed to flush connection: {}", e))?;
+
+        Ok(targets)
+    }
+
+    fn read_incr_property(&self, property: Atom) -> Result<Option<(Atom, Vec<u8>)>, String> {
+        debug!("[X11] Reading INCR property: {}", property);
+
+        self.conn
+            .delete_property(self.window, property)
+            .map_err(|e| format!("Failed to delete INCR property: {}", e))?;
+        self.conn
+            .flush()
+            .map_err(|e| format!("Failed to flush connection: {}", e))?;
+
+        let mut bytes = Vec::new();
+        let mut data_type = AtomEnum::NONE.into();
+
+        for _ in 0..500 {
+            std::thread::sleep(Duration::from_millis(20));
+
+            match self.conn.poll_for_event() {
+                Ok(Some(Event::PropertyNotify(event)))
+                    if event.atom == property && event.state == Property::NEW_VALUE =>
+                {
+                    let prop = self
+                        .conn
+                        .get_property::<u32, u32>(
+                            true,
+                            self.window,
+                            property,
+                            AtomEnum::ANY.into(),
+                            0,
+                            u32::MAX,
+                        )
+                        .map_err(|e| format!("Failed to get INCR chunk: {}", e))?
+                        .reply()
+                        .map_err(|e| format!("Failed to get INCR chunk reply: {}", e))?;
+
+                    if prop.value.is_empty() {
+                        debug!("[X11] Finished INCR transfer: {} bytes", bytes.len());
+                        return if bytes.is_empty() {
+                            Ok(None)
+                        } else {
+                            Ok(Some((data_type, bytes)))
+                        };
+                    }
+
+                    if data_type == AtomEnum::NONE.into() {
+                        data_type = prop.type_;
+                    }
+                    bytes.extend_from_slice(&prop.value);
+                }
+                Ok(Some(Event::PropertyNotify(_))) => {}
+                Ok(Some(Event::SelectionRequest(event))) => {
+                    self.handle_selection_request(event)?;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => {}
+                Err(e) => {
+                    debug!("[X11] Poll error while reading INCR property: {}", e);
+                }
+            }
+        }
+
+        warn!("[X11] INCR transfer timed out after {} bytes", bytes.len());
+        if bytes.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some((data_type, bytes)))
+        }
+    }
+
+    fn read_selection_property(&self, property: Atom) -> Result<Option<(Atom, Vec<u8>)>, String> {
+        let prop = self
+            .conn
+            .get_property::<u32, u32>(
+                false,
+                self.window,
+                property,
+                AtomEnum::ANY.into(),
+                0,
+                u32::MAX,
+            )
+            .map_err(|e| format!("Failed to get property: {}", e))?
+            .reply()
+            .map_err(|e| format!("Failed to get property reply: {}", e))?;
+
+        debug!(
+            "[X11] Property read: type={}, format={}, bytes={}",
+            prop.type_,
+            prop.format,
+            prop.value.len()
+        );
+
+        if prop.type_ == self.get_atom(INCR_ATOM).unwrap() {
+            return self.read_incr_property(property);
+        }
+
+        if prop.type_ == 0 || prop.value.is_empty() {
+            warn!("[X11] Property is empty or invalid");
+            self.conn
+                .delete_property(self.window, property)
+                .map_err(|e| format!("Failed to delete property: {}", e))?;
+            self.conn
+                .flush()
+                .map_err(|e| format!("Failed to flush connection: {}", e))?;
+            return Ok(None);
+        }
+
+        let data = Some((prop.type_, prop.value));
+
+        self.conn
+            .delete_property(self.window, property)
+            .map_err(|e| format!("Failed to delete property: {}", e))?;
+        self.conn
+            .flush()
+            .map_err(|e| format!("Failed to flush connection: {}", e))?;
+
+        Ok(data)
+    }
+
+    fn request_selection_data(
+        &self,
+        selection_atom: Atom,
+        target: Atom,
+        property: Atom,
+    ) -> Result<Option<(Atom, Vec<u8>)>, String> {
+        self.conn
+            .convert_selection(self.window, selection_atom, target, property, CURRENT_TIME)
+            .map_err(|e| format!("Failed to convert selection: {}", e))?;
+        self.conn
+            .flush()
+            .map_err(|e| format!("Failed to flush connection: {}", e))?;
+
+        let Some(notify) = self.wait_for_selection_notify(target, property)? else {
+            return Ok(None);
+        };
+
+        if notify.property == AtomEnum::NONE.into() {
+            debug!(
+                "[X11] Selection notify with NONE property for target {}",
+                target
+            );
+            return Ok(None);
+        }
+
+        self.read_selection_property(notify.property)
+    }
+
+    fn decode_selection_content(
+        &self,
+        target: Atom,
+        property_type: Atom,
+        bytes: Vec<u8>,
+    ) -> Result<Option<ClipboardContent>, String> {
+        let mime_type = self
+            .mime_type_for_atom(property_type)
+            .or_else(|| self.mime_type_for_atom(target));
+
+        let Some(mime_type) = mime_type else {
+            warn!(
+                "[X11] Unsupported property type: {} for target {}",
+                property_type, target
+            );
+            return Ok(None);
+        };
+
+        decode_clipboard_content(mime_type, bytes).map(Some)
+    }
+
+    fn write_content_for_target(
+        &self,
+        requestor: Window,
+        property: Atom,
+        target: Atom,
+        content: &ClipboardContent,
+    ) -> Result<bool, String> {
+        let targets = self.get_atom(TARGETS_ATOM).unwrap();
+
+        if target == targets {
+            let target_atoms = self.target_atoms_for_content(Some(content));
+            self.conn
+                .change_property32(
+                    x11rb::protocol::xproto::PropMode::REPLACE,
+                    requestor,
+                    property,
+                    AtomEnum::ATOM,
+                    &target_atoms,
+                )
+                .map_err(|e| format!("Failed to change TARGETS property: {}", e))?;
+            return Ok(true);
+        }
+
+        let Some(mime_type) = self.mime_type_for_atom(target) else {
+            return Ok(false);
+        };
+
+        let Some(bytes) = content.bytes_for_mime(mime_type) else {
+            return Ok(false);
+        };
+
+        self.conn
+            .change_property8(
+                x11rb::protocol::xproto::PropMode::REPLACE,
+                requestor,
+                property,
+                target,
+                bytes,
+            )
+            .map_err(|e| format!("Failed to change selection property: {}", e))?;
+
+        Ok(true)
+    }
+
     pub fn set_clipboard_content(
         &self,
-        content: String,
+        content: ClipboardContent,
         clipboard_type: ClipboardType,
     ) -> Result<(), String> {
         info!(
@@ -168,16 +510,23 @@ impl X11State {
         };
 
         // Store content
-        let utf8_string = self.get_atom(UTF8_STRING_ATOM).unwrap();
-        let content_bytes = content.as_bytes();
+        let mime_type = content
+            .primary_mime_type()
+            .ok_or_else(|| "Cannot set empty clipboard content".to_string())?;
+        let content_atom = self
+            .get_atom(mime_type)
+            .ok_or_else(|| format!("MIME atom not interned: {}", mime_type))?;
+        let content_bytes = content
+            .bytes_for_mime(mime_type)
+            .ok_or_else(|| format!("Content cannot be represented as {}", mime_type))?;
 
         // Set property on our window
         self.conn
             .change_property8(
                 x11rb::protocol::xproto::PropMode::REPLACE,
                 self.window,
-                utf8_string,
-                utf8_string,
+                content_atom,
+                content_atom,
                 content_bytes,
             )
             .map_err(|e| format!("Failed to change property: {}", e))?;
@@ -195,10 +544,10 @@ impl X11State {
 
         match clipboard_type {
             ClipboardType::Clipboard => {
-                *self.clipboard_content.blocking_lock() = Some(content.clone());
+                *self.clipboard_content.blocking_lock() = Some(content);
             }
             ClipboardType::Primary => {
-                *self.primary_content.blocking_lock() = Some(content.clone());
+                *self.primary_content.blocking_lock() = Some(content);
             }
         }
 
@@ -214,11 +563,6 @@ impl X11State {
             ClipboardType::Primary => AtomEnum::PRIMARY.into(),
         };
 
-        let utf8_string = self.get_atom(UTF8_STRING_ATOM).unwrap();
-        let text_plain = self.get_atom(TEXT_PLAIN_ATOM).unwrap();
-        let string_atom = self.get_atom(STRING_ATOM).unwrap();
-
-        // First check if we own the selection
         let owner = self
             .conn
             .get_selection_owner(selection_atom)
@@ -239,159 +583,58 @@ impl X11State {
 
         debug!("[X11] Requesting selection from owner: {}", owner.owner);
 
-        // Try multiple targets in order of preference
-        let targets = [utf8_string, text_plain, string_atom];
-        for (i, target) in targets.iter().enumerate() {
-            let property = match self.get_atom(&format!("CLIP_TEMP_{}", i)) {
-                Some(atom) => atom,
-                None => {
-                    // Create a temporary atom if needed
-                    let atom = self
-                        .conn
-                        .intern_atom(false, format!("CLIP_TEMP_{}", i).as_bytes())
-                        .unwrap();
-                    atom.reply().unwrap().atom
-                }
+        let offered_targets = self.request_selection_targets(selection_atom)?;
+        let targets = self.choose_supported_targets(&offered_targets);
+
+        for (index, (target, mime_type)) in targets.iter().enumerate() {
+            let property = self.intern_temp_atom(&format!("CLIP_TEMP_{}", index))?;
+            debug!(
+                "[X11] Trying target {} ({}) with property {}",
+                target, mime_type, property
+            );
+
+            let Some((property_type, bytes)) =
+                self.request_selection_data(selection_atom, *target, property)?
+            else {
+                debug!("[X11] No valid response for target {}", target);
+                continue;
             };
 
-            debug!("[X11] Trying target {} with property {}", target, property);
+            let Some(content) = self.decode_selection_content(*target, property_type, bytes)?
+            else {
+                continue;
+            };
 
-            // Request selection
-            self.conn
-                .convert_selection(self.window, selection_atom, *target, property, CURRENT_TIME)
-                .map_err(|e| format!("Failed to convert selection: {}", e))?;
-            self.conn
-                .flush()
-                .map_err(|e| format!("Failed to flush connection: {}", e))?;
+            if content.is_empty() {
+                debug!("[X11] Ignoring empty clipboard content");
+                continue;
+            }
 
-            // Wait longer for response - some apps take time to respond
-            for _ in 0..10 {
-                std::thread::sleep(Duration::from_millis(20));
+            info!(
+                "[X11] Received clipboard content: type={:?}, mime={:?}, len={}",
+                clipboard_type,
+                content.primary_mime_type(),
+                content.len()
+            );
 
-                // Check if we got a response
-                match self.conn.poll_for_event() {
-                    Ok(Some(Event::SelectionNotify(notify))) => {
-                        if notify.property != AtomEnum::NONE.into() {
-                            debug!("[X11] Got selection notify for target {}", target);
-                            // Read the property content
-                            let prop = self
-                                .conn
-                                .get_property::<u32, u32>(
-                                    false,
-                                    self.window,
-                                    notify.property,
-                                    AtomEnum::ANY.into(),
-                                    0,
-                                    u32::MAX,
-                                )
-                                .map_err(|e| format!("Failed to get property: {}", e))?
-                                .reply()
-                                .map_err(|e| format!("Failed to get property reply: {}", e))?;
-
-                            debug!(
-                                "[X11] Property read: type={}, format={}, bytes={}",
-                                prop.type_,
-                                prop.format,
-                                prop.value.len()
-                            );
-
-                            // Check if property is empty or invalid
-                            if prop.type_ == 0 || prop.value.is_empty() {
-                                warn!("[X11] Property is empty or invalid");
-                                self.conn
-                                    .delete_property(self.window, notify.property)
-                                    .map_err(|e| format!("Failed to delete property: {}", e))?;
-                                self.conn
-                                    .flush()
-                                    .map_err(|e| format!("Failed to flush connection: {}", e))?;
-                                break;
-                            }
-
-                            // Try to decode based on property type
-                            let content = if prop.type_ == utf8_string || prop.type_ == text_plain {
-                                String::from_utf8(prop.value.clone())
-                                    .map_err(|e| format!("Failed to convert to UTF-8: {}", e))?
-                            } else if prop.type_ == string_atom {
-                                // STRING is typically Latin-1
-                                prop.value.iter().map(|&b| b as char).collect::<String>()
-                            } else {
-                                warn!(
-                                    "[X11] Unsupported property type: {} (expected UTF8_STRING={}, STRING={}, TEXT_PLAIN={})",
-                                    prop.type_, utf8_string, string_atom, text_plain
-                                );
-                                self.conn
-                                    .delete_property(self.window, notify.property)
-                                    .map_err(|e| format!("Failed to delete property: {}", e))?;
-                                self.conn
-                                    .flush()
-                                    .map_err(|e| format!("Failed to flush connection: {}", e))?;
-                                break;
-                            };
-
-                            info!(
-                                "[X11] Received clipboard content: type={:?}, len={}",
-                                clipboard_type,
-                                content.len()
-                            );
-
-                            match clipboard_type {
-                                ClipboardType::Clipboard => {
-                                    *self.clipboard_content.blocking_lock() = Some(content.clone());
-                                }
-                                ClipboardType::Primary => {
-                                    *self.primary_content.blocking_lock() = Some(content.clone());
-                                }
-                            }
-
-                            // Send sync event
-                            debug!(
-                                "[X11] Sending sync event to Wayland: type={:?}, len={}",
-                                clipboard_type,
-                                content.len()
-                            );
-                            match self.sync_tx.send(SyncEvent::X11ToWayland {
-                                content: ClipboardContent::Text(content),
-                                clipboard_type,
-                            }) {
-                                Ok(_) => debug!("[X11] Sync event sent successfully"),
-                                Err(e) => error!("[X11] Failed to send sync event: {}", e),
-                            }
-
-                            // Delete property
-                            self.conn
-                                .delete_property(self.window, notify.property)
-                                .map_err(|e| format!("Failed to delete property: {}", e))?;
-                            self.conn
-                                .flush()
-                                .map_err(|e| format!("Failed to flush connection: {}", e))?;
-
-                            // Success, don't try other targets
-                            return Ok(());
-                        } else {
-                            debug!(
-                                "[X11] Selection notify with NONE property for target {}",
-                                target
-                            );
-                            break;
-                        }
-                    }
-                    Ok(Some(Event::PropertyNotify(_))) => {
-                        // Property changed, might be our data
-                        continue;
-                    }
-                    Ok(Some(_)) => {
-                        // Other event, continue waiting
-                    }
-                    Ok(None) => {
-                        // No event yet, continue waiting
-                    }
-                    Err(e) => {
-                        debug!("[X11] Poll error: {}", e);
-                    }
+            match clipboard_type {
+                ClipboardType::Clipboard => {
+                    *self.clipboard_content.blocking_lock() = Some(content.clone());
+                }
+                ClipboardType::Primary => {
+                    *self.primary_content.blocking_lock() = Some(content.clone());
                 }
             }
 
-            debug!("[X11] No valid response for target {}", target);
+            match self.sync_tx.send(SyncEvent::X11ToWayland {
+                content,
+                clipboard_type,
+            }) {
+                Ok(_) => debug!("[X11] Sync event sent successfully"),
+                Err(e) => error!("[X11] Failed to send sync event: {}", e),
+            }
+
+            return Ok(());
         }
 
         Ok(())
@@ -400,22 +643,28 @@ impl X11State {
     pub fn handle_selection_request(&self, event: SelectionRequestEvent) -> Result<(), String> {
         debug!("[X11] Selection request: {:?}", event);
 
-        let utf8_string = self.get_atom(UTF8_STRING_ATOM).unwrap();
         let targets = self.get_atom(TARGETS_ATOM).unwrap();
         let multiple = self.get_atom(MULTIPLE_ATOM).unwrap();
 
         let target = event.target;
-        let mut property = event.property;
+        let mut property = if event.property == AtomEnum::NONE.into() {
+            event.target
+        } else {
+            event.property
+        };
+
+        let content = match event.selection {
+            s if s == self.get_atom(CLIPBOARD_ATOM).unwrap() => {
+                self.clipboard_content.blocking_lock().clone()
+            }
+            s if s == AtomEnum::PRIMARY.into() => self.primary_content.blocking_lock().clone(),
+            _ => None,
+        };
 
         // Handle TARGETS request
         if target == targets {
             debug!("[X11] Handling TARGETS request");
-            let target_atoms = vec![
-                utf8_string,
-                self.get_atom(STRING_ATOM).unwrap(),
-                self.get_atom(TEXT_ATOM).unwrap(),
-                targets,
-            ];
+            let target_atoms = self.target_atoms_for_content(content.as_ref());
             self.conn
                 .change_property32(
                     x11rb::protocol::xproto::PropMode::REPLACE,
@@ -437,54 +686,61 @@ impl X11State {
                 .reply()
                 .map_err(|e| format!("Failed to get property reply: {}", e))?;
 
-            let atoms = prop.value32().into_iter().flatten().collect::<Vec<_>>();
-            for chunk in atoms.chunks(2) {
+            let mut atoms = prop.value32().into_iter().flatten().collect::<Vec<_>>();
+            for chunk in atoms.chunks_mut(2) {
                 if chunk.len() == 2 {
-                    // Handle each pair (target, property)
-                    // For simplicity, we just set the property to empty
-                    self.conn
-                        .change_property8(
-                            x11rb::protocol::xproto::PropMode::REPLACE,
+                    let request_target = chunk[0];
+                    let request_property = chunk[1];
+                    let handled = if request_property == AtomEnum::NONE.into() {
+                        false
+                    } else if request_target == targets {
+                        let target_atoms = self.target_atoms_for_content(content.as_ref());
+                        self.conn
+                            .change_property32(
+                                x11rb::protocol::xproto::PropMode::REPLACE,
+                                event.requestor,
+                                request_property,
+                                AtomEnum::ATOM,
+                                &target_atoms,
+                            )
+                            .map_err(|e| format!("Failed to change TARGETS property: {}", e))?;
+                        true
+                    } else if let Some(content) = content.as_ref() {
+                        self.write_content_for_target(
                             event.requestor,
-                            chunk[1],
-                            AtomEnum::STRING,
-                            &[],
-                        )
-                        .map_err(|e| format!("Failed to change property8: {}", e))?;
+                            request_property,
+                            request_target,
+                            content,
+                        )?
+                    } else {
+                        false
+                    };
+
+                    if !handled {
+                        chunk[1] = AtomEnum::NONE.into();
+                    }
                 }
             }
-        }
-        // Handle text requests
-        else if target == utf8_string
-            || target == self.get_atom(STRING_ATOM).unwrap()
-            || target == self.get_atom(TEXT_ATOM).unwrap()
-        {
-            debug!("[X11] Handling text request for target: {}", target);
-            let content = match event.selection {
-                s if s == self.get_atom(CLIPBOARD_ATOM).unwrap() => {
-                    self.clipboard_content.blocking_lock().clone()
-                }
-                s if s == AtomEnum::PRIMARY.into() => self.primary_content.blocking_lock().clone(),
-                _ => None,
-            };
 
-            if let Some(text) = content {
-                debug!("[X11] Sending text content: {} chars", text.len());
-                self.conn
-                    .change_property8(
-                        x11rb::protocol::xproto::PropMode::REPLACE,
-                        event.requestor,
-                        property,
-                        utf8_string,
-                        text.as_bytes(),
-                    )
-                    .map_err(|e| format!("Failed to change property8: {}", e))?;
-            } else {
-                warn!("[X11] No content available for request");
+            self.conn
+                .change_property32(
+                    x11rb::protocol::xproto::PropMode::REPLACE,
+                    event.requestor,
+                    property,
+                    AtomEnum::ATOM,
+                    &atoms,
+                )
+                .map_err(|e| format!("Failed to update MULTIPLE property: {}", e))?;
+        }
+        // Handle concrete data requests
+        else if let Some(content) = content.as_ref() {
+            debug!("[X11] Handling content request for target: {}", target);
+            if !self.write_content_for_target(event.requestor, property, target, content)? {
+                debug!("[X11] Unsupported target: {}", target);
                 property = AtomEnum::NONE.into();
             }
         } else {
-            debug!("[X11] Unsupported target: {}", target);
+            warn!("[X11] No content available for request");
             property = AtomEnum::NONE.into();
         }
 
@@ -521,64 +777,12 @@ impl X11State {
             return Ok(());
         }
 
-        let utf8_string = self.get_atom(UTF8_STRING_ATOM).unwrap();
-        let string_atom = self.get_atom(STRING_ATOM).unwrap();
-        let text_plain = self.get_atom(TEXT_PLAIN_ATOM).unwrap();
-
-        // Read the property - try different types
-        let prop = self
-            .conn
-            .get_property::<u32, u32>(
-                false,
-                self.window,
-                event.property,
-                AtomEnum::ANY.into(),
-                0,
-                u32::MAX,
-            )
-            .map_err(|e| format!("Failed to get property: {}", e))?
-            .reply()
-            .map_err(|e| format!("Failed to get property reply: {}", e))?;
-
-        debug!(
-            "[X11] Property read: type={}, format={}, bytes={}",
-            prop.type_,
-            prop.format,
-            prop.value.len()
-        );
-
-        // Check if property is empty or invalid
-        if prop.type_ == 0 || prop.value.is_empty() {
-            warn!("[X11] Property is empty or invalid");
-            // Delete the property and return
-            self.conn
-                .delete_property(self.window, event.property)
-                .map_err(|e| format!("Failed to delete property: {}", e))?;
-            self.conn
-                .flush()
-                .map_err(|e| format!("Failed to flush connection: {}", e))?;
+        let Some((property_type, bytes)) = self.read_selection_property(event.property)? else {
             return Ok(());
-        }
+        };
 
-        // Try to decode based on property type
-        let content = if prop.type_ == utf8_string || prop.type_ == text_plain {
-            String::from_utf8(prop.value.clone())
-                .map_err(|e| format!("Failed to convert to UTF-8: {}", e))?
-        } else if prop.type_ == string_atom {
-            // STRING is typically Latin-1
-            prop.value.iter().map(|&b| b as char).collect::<String>()
-        } else {
-            warn!(
-                "[X11] Unsupported property type: {} (expected UTF8_STRING={}, STRING={}, TEXT_PLAIN={})",
-                prop.type_, utf8_string, string_atom, text_plain
-            );
-            // Delete the property and return
-            self.conn
-                .delete_property(self.window, event.property)
-                .map_err(|e| format!("Failed to delete property: {}", e))?;
-            self.conn
-                .flush()
-                .map_err(|e| format!("Failed to flush connection: {}", e))?;
+        let Some(content) = self.decode_selection_content(event.target, property_type, bytes)?
+        else {
             return Ok(());
         };
 
@@ -589,8 +793,9 @@ impl X11State {
         };
 
         info!(
-            "[X11] Received clipboard content: type={:?}, len={}",
+            "[X11] Received clipboard content: type={:?}, mime={:?}, len={}",
             clipboard_type,
+            content.primary_mime_type(),
             content.len()
         );
 
@@ -605,17 +810,9 @@ impl X11State {
 
         // Send sync event
         let _ = self.sync_tx.send(SyncEvent::X11ToWayland {
-            content: ClipboardContent::Text(content),
+            content,
             clipboard_type,
         });
-
-        // Delete the property
-        self.conn
-            .delete_property(self.window, event.property)
-            .map_err(|e| format!("Failed to delete property: {}", e))?;
-        self.conn
-            .flush()
-            .map_err(|e| format!("Failed to flush connection: {}", e))?;
 
         Ok(())
     }
@@ -651,40 +848,111 @@ impl X11State {
         Ok(())
     }
 
+    fn handle_event(&self, event: Event) -> Result<(), String> {
+        match event {
+            Event::SelectionRequest(e) => self.handle_selection_request(e)?,
+            Event::SelectionNotify(e) => self.handle_selection_notify(e)?,
+            Event::SelectionClear(e) => self.handle_selection_clear(e)?,
+            Event::PropertyNotify(e) => self.handle_property_notify(e)?,
+            Event::XfixesSelectionNotify(e) => self.handle_xfixes_selection_notify(e)?,
+            _ => {
+                debug!("[X11] Unhandled event: {:?}", event);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn drain_wake_pipe(&self) {
+        let mut buffer = [0u8; 64];
+        match unistd::read(&self.wake_read, &mut buffer) {
+            Ok(bytes) => debug!("[X11] Drained {} wake bytes", bytes),
+            Err(e) => debug!("[X11] Failed to drain wake pipe: {}", e),
+        }
+    }
+
+    fn drain_set_clipboard_requests(&self) -> Result<bool, String> {
+        let mut did_work = false;
+
+        loop {
+            match self.set_clipboard_rx.try_recv() {
+                Ok((content, clipboard_type)) => {
+                    self.set_clipboard_content(content, clipboard_type)?;
+                    did_work = true;
+                }
+                Err(std_mpsc::TryRecvError::Empty) => break,
+                Err(std_mpsc::TryRecvError::Disconnected) => {
+                    warn!("[X11] Set clipboard channel disconnected");
+                    break;
+                }
+            }
+        }
+
+        Ok(did_work)
+    }
+
+    fn drain_x11_events(&self) -> Result<bool, String> {
+        let mut did_work = false;
+
+        loop {
+            match self.conn.poll_for_event() {
+                Ok(Some(event)) => {
+                    self.handle_event(event)?;
+                    did_work = true;
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    debug!("[X11] Poll error: {}", e);
+                    break;
+                }
+            }
+        }
+
+        Ok(did_work)
+    }
+
     pub fn run_event_loop(&mut self) -> Result<(), String> {
         info!("[X11] Starting event loop");
 
         loop {
-            // Check for set clipboard requests
-            if let Ok((content, clipboard_type)) = self.set_clipboard_rx.try_recv() {
-                let _ = self.set_clipboard_content(content, clipboard_type);
+            let handled_commands = self.drain_set_clipboard_requests()?;
+            let handled_events = self.drain_x11_events()?;
+
+            if handled_commands || handled_events {
+                let _ = self.conn.flush();
+                continue;
             }
 
-            // Process X11 events
-            match self.conn.poll_for_event() {
-                Ok(Some(event)) => match event {
-                    Event::SelectionRequest(e) => self.handle_selection_request(e)?,
-                    Event::SelectionNotify(e) => self.handle_selection_notify(e)?,
-                    Event::SelectionClear(e) => self.handle_selection_clear(e)?,
-                    Event::PropertyNotify(e) => self.handle_property_notify(e)?,
-                    Event::XfixesSelectionNotify(e) => self.handle_xfixes_selection_notify(e)?,
-                    _ => {
-                        debug!("[X11] Unhandled event: {:?}", event);
-                    }
-                },
-                Ok(None) => {
-                    // No events, continue
-                }
-                Err(e) => {
-                    debug!("[X11] Poll error: {}", e);
-                }
-            }
-
-            // Flush any pending requests
             let _ = self.conn.flush();
 
-            // Sleep to avoid busy waiting
-            std::thread::sleep(Duration::from_millis(10));
+            let (x11_ready, wake_ready) = {
+                let mut poll_fds = [
+                    PollFd::new(self.conn.stream().as_fd(), PollFlags::POLLIN),
+                    PollFd::new(self.wake_read.as_fd(), PollFlags::POLLIN),
+                ];
+
+                poll(&mut poll_fds, PollTimeout::NONE)
+                    .map_err(|e| format!("Failed to poll X11 event fds: {}", e))?;
+
+                let x11_ready = poll_fds[0]
+                    .revents()
+                    .unwrap_or_else(PollFlags::empty)
+                    .intersects(PollFlags::POLLIN | PollFlags::POLLERR | PollFlags::POLLHUP);
+                let wake_ready = poll_fds[1]
+                    .revents()
+                    .unwrap_or_else(PollFlags::empty)
+                    .intersects(PollFlags::POLLIN | PollFlags::POLLERR | PollFlags::POLLHUP);
+
+                (x11_ready, wake_ready)
+            };
+
+            if wake_ready {
+                self.drain_wake_pipe();
+            }
+
+            if !x11_ready && !wake_ready {
+                debug!("[X11] Poll returned without readable fds");
+            }
         }
     }
 
@@ -721,6 +989,7 @@ impl X11State {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
     use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
@@ -729,9 +998,10 @@ mod tests {
     fn test_x11_state_initialization() {
         let (conn, screen_num) = x11rb::connect(None).unwrap();
         let (sync_tx, _sync_rx) = unbounded_channel();
-        let (_set_clipboard_tx, set_clipboard_rx) = unbounded_channel();
+        let (_set_clipboard_tx, set_clipboard_rx) = mpsc::channel();
+        let (wake_read, _wake_write) = unistd::pipe().unwrap();
 
-        let x11_state = X11State::new(conn, screen_num, sync_tx, set_clipboard_rx);
+        let x11_state = X11State::new(conn, screen_num, sync_tx, set_clipboard_rx, wake_read);
         assert!(x11_state.is_ok(), "Failed to initialize X11State");
     }
 
@@ -739,23 +1009,24 @@ mod tests {
     fn test_atom_interning() {
         let (conn, screen_num) = x11rb::connect(None).unwrap();
         let (sync_tx, _sync_rx) = unbounded_channel();
-        let (_set_clipboard_tx, set_clipboard_rx) = unbounded_channel();
+        let (_set_clipboard_tx, set_clipboard_rx) = mpsc::channel();
+        let (wake_read, _wake_write) = unistd::pipe().unwrap();
 
-        let x11_state = X11State::new(conn, screen_num, sync_tx, set_clipboard_rx).unwrap();
+        let x11_state =
+            X11State::new(conn, screen_num, sync_tx, set_clipboard_rx, wake_read).unwrap();
 
         // Test that all required atoms are interned
-        let required_atoms = vec![
+        let mut required_atoms = vec![
             CLIPBOARD_ATOM,
             PRIMARY_ATOM,
             TARGETS_ATOM,
             MULTIPLE_ATOM,
             INCR_ATOM,
             UTF8_STRING_ATOM,
-            TEXT_ATOM,
-            STRING_ATOM,
             TEXT_PLAIN_UTF8_ATOM,
             TEXT_PLAIN_ATOM,
         ];
+        required_atoms.extend_from_slice(IMAGE_MIME_TYPES);
 
         for atom_name in required_atoms {
             assert!(

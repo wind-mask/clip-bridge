@@ -11,22 +11,17 @@ keywords = ["clipboard", "sync", "wayland", "x11"]
 categories = ["command-line-utilities"]
 
 [package.metadata.aur]
-depends = [
-  "wayland",
-  "wayland-protocols",
-  "libx11",
-  "libxkbcommon",
-  "libxkbcommon-x11"
-]
+depends = ["wayland", "wayland-protocols", "libx11", "libxkbcommon", "libxkbcommon-x11"]
 optdepends = ["wl-clipboard", "xclip"]
 
 [dependencies]
+compact_str = "0.9.1"
 # Utils
 nix = { version = "0.31.1", features = ["poll"] }
 # Async Runtime
 tokio = { version = "1.35", features = ["full"] }
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Wayland Related
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32.10", features = ["client", "unstable"] }
@@ -34,3 +29,4 @@ wayland-protocols-misc = { version = "0.3.10", features = ["client"] }
 wayland-protocols-wlr = { version = "0.3.10", features = ["client"] }
 # X11 Related
 x11rb = { version = "0.13", features = ["all-extensions"] }
+xxhash-rust = { version = "0.8.16", features = ["xxh3"] }

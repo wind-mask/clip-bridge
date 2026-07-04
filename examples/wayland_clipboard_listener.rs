@@ -1,8 +1,9 @@
 use clip_bridge::{
-    ClipboardType,
+    ClipboardContent, ClipboardType,
     wayland::{GlobalData, WaylandState},
 };
-use tokio::sync::mpsc;
+use std::sync::mpsc as std_mpsc;
+use tokio::sync::mpsc as tokio_mpsc;
 use tracing_subscriber;
 use wayland_client::Connection;
 
@@ -11,9 +12,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     // Create channels for sync events and clipboard set requests
-    let (sync_tx, mut sync_rx) = mpsc::unbounded_channel();
+    let (sync_tx, mut sync_rx) = tokio_mpsc::unbounded_channel();
     let (set_clipboard_tx, _set_clipboard_rx) =
-        mpsc::unbounded_channel::<(String, ClipboardType)>();
+        std_mpsc::channel::<(ClipboardContent, ClipboardType)>();
 
     // Connect to Wayland server
     let wayland_conn = Connection::connect_to_env()?;
